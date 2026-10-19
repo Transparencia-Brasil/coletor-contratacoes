@@ -1,0 +1,31 @@
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Cache e bytecode do Python
+__pycache__/
+*.py[cod]
+
+# Distribuição e empacotamento
+build/
+dist/
+*.egg-info/
+
+# Caches de ferramentas e cobertura de testes
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Configurações locais e logs
+.env
+.env.*
+*.env
+!.env.example
+*.log

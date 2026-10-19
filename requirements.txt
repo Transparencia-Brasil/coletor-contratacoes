@@ -1,0 +1,2 @@
+# Adicione aqui as dependências externas necessárias ao projeto.
+# O template utiliza apenas a biblioteca padrão do Python.
