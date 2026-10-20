@@ -1,1 +1,0 @@
-"""Código-fonte do projeto."""

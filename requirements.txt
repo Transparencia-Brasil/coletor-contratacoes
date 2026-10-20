@@ -1,2 +1,4 @@
 # Adicione aqui as dependências externas necessárias ao projeto.
-# O template utiliza apenas a biblioteca padrão do Python.
+requests>=2.32,<3
+python-dotenv>=1,<2
+

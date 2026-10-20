@@ -3,6 +3,14 @@
 venv/
 env/
 
+# Saídas dos coletores e downloads temporários, em qualquer nível
+outputs/
+tmp/
+*.csv
+*.jsonl
+*.jsonl.gz
+*.part
+
 # Cache e bytecode do Python
 __pycache__/
 *.py[cod]
@@ -29,3 +37,19 @@ htmlcov/
 *.env
 !.env.example
 *.log
+
+# Credenciais locais e chaves privadas
+.aws/
+.ssh/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Arquivos temporários de editores e do sistema operacional
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
