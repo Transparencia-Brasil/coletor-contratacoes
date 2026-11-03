@@ -6,16 +6,22 @@ arquivo JSON Lines compactado por ano. Cada linha é um processo de contrataçã
 (`awards`).
 
 O arquivo do ano inteiro tem centenas de MB e cobre o país todo. O coletor o
-baixa para `tmp/`, lê linha a linha sem carregar tudo na memória e mantém apenas
-os processos cujo comprador (`buyer`) tem `address.region` igual à UF pedida
-(padrão: DF). Opcionalmente, filtra também pela esfera do comprador.
+baixa para uma pasta temporária dentro do destino, lê linha a linha sem carregar
+tudo na memória e mantém apenas os processos cujo comprador (`buyer`) tem
+`address.region` igual à UF pedida (padrão: DF). Opcionalmente, filtra também
+pela esfera do comprador. O arquivo baixado é apagado ao final.
 
-Uso (a partir da raiz do repositório):
-    python tasks/coleta-contratacoes/src/coleta_contratacoes.py --anos 2025 2026
-    python tasks/coleta-contratacoes/src/coleta_contratacoes.py --anos 2026 --esferas Distrital
-    python tasks/coleta-contratacoes/src/coleta_contratacoes.py --anos 2026 --limite 5000   # teste rápido
+Uso, a partir de qualquer diretório:
+    python src/ETL/coletores/coleta_contratacoes.py --anos 2025 2026
+    python src/ETL/coletores/coleta_contratacoes.py --anos 2026 --esferas Distrital
+    python src/ETL/coletores/coleta_contratacoes.py --anos 2026 --limite 5000   # teste rápido
+    python src/ETL/coletores/coleta_contratacoes.py --anos 2026 --saida /caminho/da/pasta
 
-Saídas em `tasks/coleta-contratacoes/outputs/<alias>/`:
+Sem --saida, as saídas vão para
+outputs/contratacoes/<UF>[-<esferas>]-<anos>/<AAAAMMDD_HHMMSS>/, na raiz do
+repositório. Uma pasta de destino que já tenha arquivos é recusada.
+
+Arquivos gerados no destino:
     contratacoes.jsonl.gz  releases OCDS originais, só as selecionadas
     contratacoes.csv       uma linha por processo de contratação
     itens.csv              uma linha por item licitado (tender.items + lote)
@@ -23,6 +29,9 @@ Saídas em `tasks/coleta-contratacoes/outputs/<alias>/`:
     monitoramento.csv      resumo de cada ano processado
     erros.csv              linhas ou anos que falharam
     coleta.log             log da execução
+
+Códigos de saída: 0 sucesso; 1 algum ano falhou; 2 argumento inválido ou
+destino já ocupado.
 """
 
 from __future__ import annotations
@@ -33,8 +42,11 @@ import gzip
 import json
 import logging
 import os
+import re
 import sys
+import tempfile
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -45,18 +57,19 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-TASK_DIR = Path(__file__).resolve().parents[1]
-RAIZ_REPO = TASK_DIR.parents[1]
+RAIZ_REPO = Path(__file__).resolve().parents[3]
+PASTA_SAIDA_PADRAO = RAIZ_REPO / "outputs" / "contratacoes"
 
-load_dotenv(RAIZ_REPO / ".env")
+load_dotenv(RAIZ_REPO / ".env", override=False)
 
 URL_DOWNLOAD = os.getenv(
     "OCP_COMPRAS_DOWNLOAD_URL",
     "https://data.open-contracting.org/en/publication/157/download",
 )
-TIMEOUT = int(os.getenv("API_TIMEOUT_SECONDS", "30"))
-TAMANHO_BLOCO = 1024 * 1024  # 1 MB
+TIMEOUT = float(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "60"))
+TAMANHO_BLOCO = 1024 * 1024  # 1 MiB
 LOG_A_CADA_BYTES = 50 * TAMANHO_BLOCO
+LOG_A_CADA_LINHAS = 50_000
 
 log = logging.getLogger("coleta_contratacoes")
 
@@ -99,23 +112,44 @@ COLUNAS_MONITORAMENTO = [
 
 COLUNAS_ERROS = ["ano", "linha", "ocid", "etapa", "erro"]
 
+# Nome de cada CSV gerado (sem extensão) e suas colunas.
+CSVS = {
+    "contratacoes": COLUNAS_CONTRATACOES,
+    "itens": COLUNAS_ITENS,
+    "adjudicacoes": COLUNAS_ADJUDICACOES,
+    "monitoramento": COLUNAS_MONITORAMENTO,
+    "erros": COLUNAS_ERROS,
+}
+
 
 # ------------------------------------------------------------------------------
 # Utilidades
 # ------------------------------------------------------------------------------
 
 def sessao_http() -> requests.Session:
-    """Sessão com novas tentativas e espera crescente para falhas transitórias."""
+    """Cria uma sessão que repete GETs com falhas transitórias.
+
+    Repete até 8 vezes falhas de conexão e respostas 429, 500, 502, 503 e 504,
+    com espera crescente de fator 2 e respeito ao cabeçalho Retry-After.
+    Esgotadas as tentativas, a última resposta é devolvida para quem chamou
+    tratar o status.
+    """
     tentativas = Retry(
         total=8,
         backoff_factor=2,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET", "HEAD"),
+        allowed_methods=("GET",),
         respect_retry_after_header=True,
+        raise_on_status=False,
     )
     sessao = requests.Session()
-    sessao.mount("https://", HTTPAdapter(max_retries=tentativas))
-    sessao.headers["User-Agent"] = "medicamentos-fdcc/coleta-contratacoes (Transparencia Brasil)"
+    adaptador = HTTPAdapter(max_retries=tentativas)
+    sessao.mount("https://", adaptador)
+    sessao.mount("http://", adaptador)
+    sessao.headers["User-Agent"] = "Transparencia-Brasil/coletor-contratacoes"
+    # Sem compressão de transporte: o arquivo já é .gz e precisa chegar como foi
+    # publicado para conferir com o Content-Length.
+    sessao.headers["Accept-Encoding"] = "identity"
     return sessao
 
 
@@ -158,26 +192,25 @@ def multiplica(a: Any, b: Any) -> float | None:
 
 
 class EscritorCSV:
-    """Abre um CSV com cabeçalho e conta as linhas escritas."""
+    """CSV com cabeçalho que conta as linhas escritas; usado como context manager."""
 
     def __init__(self, caminho: Path, colunas: list[str]):
-        """Abre ou sobrescreve o CSV em UTF-8 e escreve o cabeçalho informado."""
+        """Cria o CSV em UTF-8 e escreve o cabeçalho informado."""
         self.arquivo = caminho.open("w", encoding="utf-8", newline="")
         self.writer = csv.DictWriter(self.arquivo, fieldnames=colunas, extrasaction="raise")
         self.writer.writeheader()
         self.linhas = 0
 
-    def escreve(self, linhas: Iterable[dict]) -> int:
-        """Escreve as linhas, atualiza o contador e retorna a quantidade escrita."""
-        n = 0
-        for linha in linhas:
-            self.writer.writerow(linha)
-            n += 1
-        self.linhas += n
-        return n
+    def escreve(self, linhas: Iterable[dict]) -> None:
+        """Escreve as linhas e atualiza o contador."""
+        linhas = list(linhas)
+        self.writer.writerows(linhas)
+        self.linhas += len(linhas)
 
-    def fecha(self) -> None:
-        """Fecha o arquivo CSV, descarregando os dados pendentes de escrita."""
+    def __enter__(self) -> EscritorCSV:
+        return self
+
+    def __exit__(self, *_: object) -> None:
         self.arquivo.close()
 
 
@@ -185,17 +218,18 @@ class EscritorCSV:
 # Download
 # ------------------------------------------------------------------------------
 
-def baixa_arquivo(sessao: requests.Session, ano: int, destino: Path, forcar: bool) -> tuple[str, int]:
-    """Baixa `<ano>.jsonl.gz` para `destino`. Reaproveita o arquivo se já existir."""
+def baixa_arquivo(sessao: requests.Session, ano: int, destino: Path) -> tuple[str, int]:
+    """Baixa `<ano>.jsonl.gz` em streaming para `destino`.
+
+    Returns:
+        URL baixada e total de bytes gravados.
+
+    Raises:
+        requests.HTTPError: Se a resposta final não for 2xx.
+        IOError: Se o total recebido diferir do Content-Length declarado.
+    """
     params = {"name": f"{ano}.jsonl.gz"}
     url = requests.Request("GET", URL_DOWNLOAD, params=params).prepare().url
-
-    if destino.exists() and not forcar:
-        log.info("Reaproveitando download existente: %s (%.1f MB)", destino, destino.stat().st_size / 1e6)
-        return url, destino.stat().st_size
-
-    destino.parent.mkdir(parents=True, exist_ok=True)
-    parcial = destino.with_suffix(destino.suffix + ".part")
     log.info("Baixando %s", url)
 
     with sessao.get(URL_DOWNLOAD, params=params, stream=True, timeout=TIMEOUT) as resposta:
@@ -203,7 +237,7 @@ def baixa_arquivo(sessao: requests.Session, ano: int, destino: Path, forcar: boo
         total_esperado = int(resposta.headers.get("Content-Length") or 0)
         baixados = 0
         proximo_log = LOG_A_CADA_BYTES
-        with parcial.open("wb") as arquivo:
+        with destino.open("wb") as arquivo:
             for bloco in resposta.iter_content(chunk_size=TAMANHO_BLOCO):
                 arquivo.write(bloco)
                 baixados += len(bloco)
@@ -214,7 +248,6 @@ def baixa_arquivo(sessao: requests.Session, ano: int, destino: Path, forcar: boo
     if total_esperado and baixados != total_esperado:
         raise IOError(f"Download incompleto: {baixados} de {total_esperado} bytes")
 
-    parcial.replace(destino)
     log.info("Download concluído: %.1f MB", baixados / 1e6)
     return url, baixados
 
@@ -227,6 +260,10 @@ def baixa_arquivo(sessao: requests.Session, ano: int, destino: Path, forcar: boo
 class Filtro:
     uf: str
     esferas: set[str] = field(default_factory=set)  # vazio = todas
+
+    def __post_init__(self) -> None:
+        # A UF entre aspas, sem diferenciar maiúsculas, como em comprador().
+        self._marcador = re.compile(f'"{re.escape(self.uf)}"', re.IGNORECASE)
 
     def comprador(self, release: dict) -> dict | None:
         """Devolve a parte compradora se a release passar no filtro."""
@@ -242,6 +279,15 @@ class Filtro:
         if self.esferas and classificacao(comprador, "BRA-ESFERA") not in self.esferas:
             return None
         return comprador
+
+    def pode_passar(self, linha: str) -> bool:
+        """Pré-filtro textual, bem mais barato que o json.loads.
+
+        Só descarta linhas em que a UF nem aparece entre aspas; elas falhariam
+        em comprador() de qualquer forma. As demais seguem para o filtro real.
+        Em 2026, só 6% das linhas do arquivo nacional passam para o DF.
+        """
+        return self._marcador.search(linha) is not None
 
 
 def linha_contratacao(release: dict, comprador: dict, ano: int) -> dict:
@@ -292,7 +338,6 @@ def linhas_itens(release: dict) -> Iterator[dict]:
     lotes = {lote.get("id"): lote for lote in tender.get("lots") or []}
     for item in tender.get("items") or []:
         lote = lotes.get(item.get("relatedLot"), {})
-        valor_unitario = get(item, "unit", "value", "amount")
         yield {
             "ocid": release.get("ocid"),
             "item_id": item.get("id"),
@@ -306,7 +351,7 @@ def linhas_itens(release: dict) -> Iterator[dict]:
             "ncm_nbs": lote.get("ncmNbsCode"),
             "quantidade": item.get("quantity"),
             "unidade": get(item, "unit", "name"),
-            "valor_unitario_estimado": valor_unitario,
+            "valor_unitario_estimado": get(item, "unit", "value", "amount"),
             "valor_total_estimado": get(lote, "value", "amount"),
             "orcamento_sigiloso": lote.get("confidentialBudget"),
             "criterio_julgamento": lote.get("awardCriteriaDetails"),
@@ -353,7 +398,7 @@ def processa_ano(
     ano: int,
     arquivo: Path,
     filtro: Filtro,
-    saida_jsonl: gzip.GzipFile,
+    saida_jsonl: Any,
     csvs: dict[str, EscritorCSV],
     limite: int | None,
 ) -> dict:
@@ -361,21 +406,26 @@ def processa_ano(
 
     Usa csvs com as chaves contratacoes, itens, adjudicacoes e erros. Registra
     falhas de leitura ou transformação de cada linha e segue o processamento;
-    falhas de escrita são propagadas. Um limite positivo restringe o número
-    de linhas do arquivo de entrada, incluindo linhas vazias ou descartadas.
+    falhas de escrita são propagadas. Um limite restringe o número de linhas
+    do arquivo de entrada, incluindo linhas vazias ou descartadas.
 
-    Retorna as contagens de linhas lidas, contratações selecionadas, itens,
-    linhas de adjudicação e erros de leitura ou transformação.
+    Returns:
+        Contagens de linhas lidas, contratações selecionadas, itens, linhas de
+        adjudicação e erros de leitura ou transformação deste ano.
     """
-    contagem = {"linhas_lidas": 0, "contratacoes_selecionadas": 0, "itens": 0, "adjudicacoes": 0, "erros": 0}
+    antes = {nome: escritor.linhas for nome, escritor in csvs.items()}
+    linhas_lidas = 0
 
     with gzip.open(arquivo, "rt", encoding="utf-8") as entrada:
         for numero_linha, linha in enumerate(entrada, start=1):
             if limite and numero_linha > limite:
                 log.info("Limite de %d linhas atingido.", limite)
                 break
-            contagem["linhas_lidas"] = numero_linha
-            if not linha.strip():
+            linhas_lidas = numero_linha
+            if numero_linha % LOG_A_CADA_LINHAS == 0:
+                log.info("  %d linhas lidas, %d selecionadas",
+                         numero_linha, csvs["contratacoes"].linhas - antes["contratacoes"])
+            if not filtro.pode_passar(linha):
                 continue
 
             ocid = None
@@ -385,12 +435,10 @@ def processa_ano(
                 comprador = filtro.comprador(release)
                 if comprador is None:
                     continue
-
                 linha_cont = linha_contratacao(release, comprador, ano)
                 itens = list(linhas_itens(release))
                 adjudicacoes = list(linhas_adjudicacoes(release))
             except Exception as erro:  # noqa: BLE001 — registra e segue
-                contagem["erros"] += 1
                 csvs["erros"].escreve([{
                     "ano": ano, "linha": numero_linha, "ocid": ocid,
                     "etapa": "leitura", "erro": f"{type(erro).__name__}: {erro}",
@@ -399,14 +447,19 @@ def processa_ano(
 
             saida_jsonl.write(linha if linha.endswith("\n") else linha + "\n")
             csvs["contratacoes"].escreve([linha_cont])
-            contagem["itens"] += csvs["itens"].escreve(itens)
-            contagem["adjudicacoes"] += csvs["adjudicacoes"].escreve(adjudicacoes)
-            contagem["contratacoes_selecionadas"] += 1
+            csvs["itens"].escreve(itens)
+            csvs["adjudicacoes"].escreve(adjudicacoes)
 
-            if numero_linha % 50_000 == 0:
-                log.info("  %d linhas lidas, %d selecionadas", numero_linha, contagem["contratacoes_selecionadas"])
+    def novas(nome: str) -> int:
+        return csvs[nome].linhas - antes[nome]
 
-    return contagem
+    return {
+        "linhas_lidas": linhas_lidas,
+        "contratacoes_selecionadas": novas("contratacoes"),
+        "itens": novas("itens"),
+        "adjudicacoes": novas("adjudicacoes"),
+        "erros": novas("erros"),
+    }
 
 
 # ------------------------------------------------------------------------------
@@ -415,6 +468,7 @@ def processa_ano(
 
 def configura_log(pasta: Path) -> None:
     """Configura o logger em INFO com saídas em stdout e pasta/coleta.log."""
+    encerra_log()
     formato = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
     log.setLevel(logging.INFO)
     for handler in (logging.StreamHandler(sys.stdout), logging.FileHandler(pasta / "coleta.log", encoding="utf-8")):
@@ -422,11 +476,30 @@ def configura_log(pasta: Path) -> None:
         log.addHandler(handler)
 
 
+def encerra_log() -> None:
+    """Fecha e remove os handlers do logger, liberando o coleta.log."""
+    for handler in list(log.handlers):
+        handler.close()
+        log.removeHandler(handler)
+
+
+def inteiro_positivo(texto: str) -> int:
+    """Converte para int maior que zero; usado como type do argparse."""
+    try:
+        valor = int(texto)
+    except ValueError:
+        valor = 0
+    if valor <= 0:
+        raise argparse.ArgumentTypeError(f"valor inválido: {texto!r}; use um inteiro positivo")
+    return valor
+
+
 def argumentos(argv: list[str] | None = None) -> argparse.Namespace:
-    """Interpreta a CLI, valida os anos, normaliza a UF e define o alias.
+    """Interpreta a CLI, valida os anos, normaliza a UF e define a pasta de saída.
 
     Usa os argumentos do processo quando argv é None. Aceita anos de 2021
-    até o ano atual e encerra via argparse se os argumentos forem inválidos.
+    até o ano atual e encerra via argparse (código 2) se os argumentos forem
+    inválidos.
     """
     ano_atual = datetime.now().year
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -435,67 +508,74 @@ def argumentos(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--uf", default="DF", help="UF do comprador. Padrão: DF.")
     parser.add_argument("--esferas", nargs="*", default=[],
                         help="Esferas do comprador a manter (ex.: Distrital Federal). Padrão: todas.")
-    parser.add_argument("--alias", help="Subpasta de saída em outputs/. Padrão: <UF>-<anos>.")
-    parser.add_argument("--forcar-download", action="store_true",
-                        help="Baixa de novo mesmo que o arquivo já esteja em tmp/.")
-    parser.add_argument("--manter-download", action="store_true",
-                        help="Não apaga o arquivo baixado em tmp/ ao final.")
-    parser.add_argument("--limite", type=int,
+    parser.add_argument("--saida", type=Path,
+                        help="Pasta de destino, que não pode ter arquivos. Caminho relativo é resolvido "
+                             "a partir do diretório atual. Padrão: outputs/contratacoes/<UF>-<anos>/<data_hora>/.")
+    parser.add_argument("--limite", type=inteiro_positivo,
                         help="Lê só as N primeiras linhas de cada ano (teste rápido).")
     args = parser.parse_args(argv)
 
     if any(ano < 2021 or ano > ano_atual for ano in args.anos):
         parser.error(f"--anos deve estar entre 2021 e {ano_atual}")
-    args.uf = args.uf.upper()
-    args.alias = args.alias or f"{args.uf}-{'-'.join(str(a) for a in sorted(args.anos))}"
+    args.anos = sorted(set(args.anos))
+    args.uf = args.uf.strip().upper()
+    if not args.uf:
+        parser.error("--uf não pode ser vazio")
+    if args.saida is None:
+        alias = "-".join([args.uf, *sorted(set(args.esferas)), *map(str, args.anos)]).replace(" ", "_")
+        args.saida = PASTA_SAIDA_PADRAO / alias / f"{datetime.now():%Y%m%d_%H%M%S}"
     return args
 
 
 def main(argv: list[str] | None = None) -> int:
     """Executa a coleta dos anos e grava dados, monitoramento, erros e log.
 
-    Continua nos anos seguintes após falhas de download ou processamento.
-    Remove downloads de anos concluídos, salvo com --manter-download.
-    Retorna 1 se algum ano falhar e 0 caso contrário; erros registrados por
-    linha não alteram o código de retorno.
+    Continua nos anos seguintes após falhas de download ou processamento. O
+    arquivo baixado de cada ano é apagado ao fim do processamento.
+
+    Returns:
+        0 se todos os anos deram certo; 1 se algum ano falhou; 2 se a pasta de
+        destino já tem arquivos. Erros registrados por linha não alteram o
+        código de retorno.
     """
     args = argumentos(argv)
+    pasta_saida: Path = args.saida.resolve()
 
-    pasta_saida = TASK_DIR / "outputs" / args.alias
-    pasta_tmp = TASK_DIR / "tmp"
+    if pasta_saida.exists() and (not pasta_saida.is_dir() or any(pasta_saida.iterdir())):
+        print(f"Erro: o destino '{pasta_saida}' já existe e não é uma pasta vazia.", file=sys.stderr)
+        return 2
     pasta_saida.mkdir(parents=True, exist_ok=True)
     configura_log(pasta_saida)
 
-    filtro = Filtro(uf=args.uf, esferas=set(args.esferas))
-    log.info("Coleta de contratações OCDS (Compras.gov.br)")
-    log.info("Anos: %s | UF: %s | esferas: %s | saída: %s",
-             args.anos, filtro.uf, sorted(filtro.esferas) or "todas", pasta_saida)
-
-    csvs = {
-        "contratacoes": EscritorCSV(pasta_saida / "contratacoes.csv", COLUNAS_CONTRATACOES),
-        "itens": EscritorCSV(pasta_saida / "itens.csv", COLUNAS_ITENS),
-        "adjudicacoes": EscritorCSV(pasta_saida / "adjudicacoes.csv", COLUNAS_ADJUDICACOES),
-        "monitoramento": EscritorCSV(pasta_saida / "monitoramento.csv", COLUNAS_MONITORAMENTO),
-        "erros": EscritorCSV(pasta_saida / "erros.csv", COLUNAS_ERROS),
-    }
-    sessao = sessao_http()
-    falhou = False
-
     try:
-        with gzip.open(pasta_saida / "contratacoes.jsonl.gz", "wt", encoding="utf-8") as saida_jsonl:
-            for ano in sorted(args.anos):
-                inicio = datetime.now()
-                t0 = time.monotonic()
-                arquivo = pasta_tmp / f"{ano}.jsonl.gz"
-                monitor = {"ano": ano, "url": None, "arquivo_bytes": None, "inicio": inicio.isoformat(timespec="seconds")}
+        filtro = Filtro(uf=args.uf, esferas=set(args.esferas))
+        log.info("Coleta de contratações OCDS (Compras.gov.br)")
+        log.info("Anos: %s | UF: %s | esferas: %s | saída: %s",
+                 args.anos, filtro.uf, sorted(filtro.esferas) or "todas", pasta_saida)
+        falhou = False
+
+        with ExitStack() as pilha:
+            csvs = {
+                nome: pilha.enter_context(EscritorCSV(pasta_saida / f"{nome}.csv", colunas))
+                for nome, colunas in CSVS.items()
+            }
+            saida_jsonl = pilha.enter_context(
+                gzip.open(pasta_saida / "contratacoes.jsonl.gz", "wt", encoding="utf-8"))
+            pasta_tmp = Path(pilha.enter_context(
+                tempfile.TemporaryDirectory(prefix=".download-", dir=pasta_saida)))
+            sessao = pilha.enter_context(sessao_http())
+
+            for ano in args.anos:
                 log.info("--- Ano %d ---", ano)
+                t0 = time.monotonic()
+                monitor = {"ano": ano, "inicio": datetime.now().isoformat(timespec="seconds")}
+                arquivo = pasta_tmp / f"{ano}.jsonl.gz"
                 try:
-                    monitor["url"], monitor["arquivo_bytes"] = baixa_arquivo(sessao, ano, arquivo, args.forcar_download)
+                    monitor["url"], monitor["arquivo_bytes"] = baixa_arquivo(sessao, ano, arquivo)
                     contagem = processa_ano(ano, arquivo, filtro, saida_jsonl, csvs, args.limite)
                     monitor.update(contagem, status="ok")
                     log.info("Ano %d: %d linhas lidas, %d contratações, %d itens, %d adjudicações, %d erros",
-                             ano, contagem["linhas_lidas"], contagem["contratacoes_selecionadas"],
-                             contagem["itens"], contagem["adjudicacoes"], contagem["erros"])
+                             ano, *contagem.values())
                 except Exception as erro:  # noqa: BLE001 — um ano com falha não interrompe os demais
                     falhou = True
                     log.exception("Falha no ano %d", ano)
@@ -503,21 +583,23 @@ def main(argv: list[str] | None = None) -> int:
                                             "etapa": "download/leitura", "erro": f"{type(erro).__name__}: {erro}"}])
                     monitor["status"] = "falha"
                 finally:
+                    arquivo.unlink(missing_ok=True)
                     monitor["fim"] = datetime.now().isoformat(timespec="seconds")
                     monitor["duracao_segundos"] = round(time.monotonic() - t0, 1)
                     csvs["monitoramento"].escreve([monitor])
-                    if not args.manter_download and arquivo.exists() and monitor["status"] == "ok":
-                        arquivo.unlink()
-    finally:
-        for escritor in csvs.values():
-            escritor.fecha()
 
-    log.info("Total: %d contratações, %d itens, %d adjudicações, %d erros",
-             csvs["contratacoes"].linhas, csvs["itens"].linhas,
-             csvs["adjudicacoes"].linhas, csvs["erros"].linhas)
-    log.info("Arquivos em %s", pasta_saida)
-    return 1 if falhou else 0
+        log.info("Total: %d contratações, %d itens, %d adjudicações, %d erros",
+                 csvs["contratacoes"].linhas, csvs["itens"].linhas,
+                 csvs["adjudicacoes"].linhas, csvs["erros"].linhas)
+        log.info("Arquivos em %s", pasta_saida)
+        return 1 if falhou else 0
+    finally:
+        encerra_log()
 
 
 if __name__ == "__main__":
+    # No Windows, a saída redirecionada (pipe, tee, arquivo) usaria cp1252; os logs
+    # de quem chama o coletor devem sair em UTF-8.
+    for fluxo in (sys.stdout, sys.stderr):
+        fluxo.reconfigure(encoding="utf-8")
     sys.exit(main())
