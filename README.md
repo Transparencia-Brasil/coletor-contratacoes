@@ -1,38 +1,37 @@
 # coletor-contratacoes
 
-Baixa os processos de contratação do Compras.gov.br em formato
-[OCDS](https://standard.open-contracting.org/), mantém só os de compradores de
-uma UF (padrão: DF) e os grava em CSVs prontos para análise, junto com as
-releases OCDS originais selecionadas.
+Baixa o arquivo anual de contratações de medicamentos em formato
+[OCDS](https://standard.open-contracting.org/), verifica se ele chegou íntegro e o
+salva exatamente como veio. O coletor não filtra, não converte e não reescreve
+dados.
 
 Criado a partir do [python-template-tb](https://github.com/Transparencia-Brasil/python-template-tb).
-É usado pela task `coleta-contratacoes` do repositório `medicamentos-fdcc`.
+É usado pela task `coleta-contratacoes` do repositório `medicamentos-fdcc`, onde
+fica o tratamento dos dados baixados.
 
-## Fonte e abrangência
+## Fonte
 
-- [OCP Data Registry, publicação 157](https://data.open-contracting.org/en/publication/157):
-  dados do Compras.gov.br (SEGES/MGI), sob licença CC BY 4.0.
-- Um arquivo `.jsonl.gz` por ano, de 2021 em diante, atualizado mensalmente pela
-  OCP. Cada linha é um processo (release compilada) com a licitação (`tender`) e
-  as adjudicações (`awards`).
-- Cada arquivo cobre o país todo: 154 MB em 2026 (202 mil processos, no arquivo
-  baixado em 03/11/2026) e 379 MB em 2025. Por isso o coletor baixa o ano inteiro e filtra localmente.
+[OCP Data Registry, publicação 153](https://data.open-contracting.org/en/publication/153):
+Medicamentos Transparentes, sob licença CC BY 4.0.
 
-## Filtro
+- É publicada pela própria Transparência Brasil e coletada pela OCP todo mês. Os
+  processos vêm do Portal Nacional de Contratações Públicas (PNCP), de todos os
+  sistemas de compras.
+- Contém só os itens de medicamentos (CATMAT classe 6505). **É um dado derivado,
+  não a fonte oficial:** os itens são selecionados por filtro de princípio ativo
+  na descrição e associados a um item do CATMAT por um modelo de linguagem (LLM).
+- Há um arquivo `{ano}.jsonl.gz` por ano, de 2021 em diante, com um processo de
+  contratação (release compilada OCDS) por linha. O de 2026 tinha 6,6 MB
+  compactado e 76 MB descompactado em 04/11/2026.
 
-Um processo é mantido quando a parte compradora (`buyer`) tem `address.region`
-igual à UF pedida, sem diferenciar maiúsculas de minúsculas. Por padrão entram
-todas as esferas (federal, distrital e outras). A esfera fica na coluna
-`comprador_esfera`, para filtrar depois. Para restringir já na coleta, use
-`--esferas`.
+A OCP redireciona o download para o CDN dela, e a URL final traz o número da
+versão da publicação, por exemplo
+`.../brazil_medicamentos_transparentes/4353/2026.jsonl.gz`. A fonte não publica
+checksum.
 
-No arquivo de 2026 baixado em 03/11/2026, foram 12.594 processos no DF, 1.459
-deles distritais.
-
-Antes do `json.loads`, um pré-filtro textual descarta as linhas em que a UF nem
-aparece entre aspas (`"DF"`). Elas falhariam no filtro de qualquer forma, e
-assim só cerca de 6% das linhas precisam ser interpretadas. Com o arquivo já
-baixado, processar 2026 leva cerca de 20 s.
+Outras publicações da OCP com o mesmo padrão de URL podem ser baixadas trocando
+`OCP_DOWNLOAD_URL` (ver [Configuração](#configuração)). Um exemplo é a 157, de
+Compras.gov.br, que é a fonte oficial da SEGES/MGI.
 
 ## Instalação
 
@@ -48,24 +47,22 @@ No Linux/macOS, ative o ambiente com `source .venv/bin/activate`.
 
 ## Execução
 
+Cada execução baixa um ano:
+
 ```powershell
-python src/ETL/coletores/coleta_contratacoes.py --anos 2025 2026
-python src/ETL/coletores/coleta_contratacoes.py --anos 2026 --esferas Distrital
-python src/ETL/coletores/coleta_contratacoes.py --anos 2026 --limite 5000   # teste rápido
+python src/ETL/coletores/coleta_contratacoes.py --ano 2026
+python src/ETL/coletores/coleta_contratacoes.py --ano 2026 --saida caminho/2026.jsonl.gz
 ```
 
-| Opção | Padrão | Para quê |
+| Opção | Obrigatória | Para quê |
 | --- | --- | --- |
-| `--anos` | ano atual | Anos a baixar, de 2021 ao ano atual. |
-| `--uf` | `DF` | UF do comprador. |
-| `--esferas` | todas | Esferas a manter: `Federal`, `Distrital`, `Estadual`, `Municipal`, `"Não se Aplica"`. |
-| `--saida` | ver abaixo | Pasta de destino. |
-| `--limite` | — | Lê só as N primeiras linhas de cada ano. |
+| `--ano` | sim | Ano com quatro dígitos. Se o ano tem arquivo é a fonte que diz: um ano sem arquivo recebe 404. |
+| `--saida` | não | Caminho completo do arquivo a gravar. |
 
 Pelo Bash, de qualquer diretório, use os mesmos argumentos:
 
 ```bash
-bash src/ETL/coletores/run-coleta-contratacoes.sh --anos 2026 --esferas Distrital
+bash src/ETL/coletores/run-coleta-contratacoes.sh --ano 2026
 ```
 
 O wrapper usa o Python do `.venv` do repositório quando ele existe e, se não
@@ -76,71 +73,82 @@ resolvido a partir de quem chama.
 
 ## Saída
 
-Sem `--saida`, cada execução grava numa pasta nova em `outputs/contratacoes/`, na
-raiz do repositório:
+Sem `--saida`, cada execução grava um arquivo novo, na raiz do repositório:
 
 ```text
-outputs/contratacoes/{UF}[-{esferas}]-{anos}/{AAAAMMDD}_{HHMMSS}/
-outputs/contratacoes/DF-2025-2026/20261103_142300/
-outputs/contratacoes/DF-Distrital-2026/20261103_142300/
+outputs/contratacoes/{ano}/{AAAAMMDD}_{HHMMSS}_contratacoes_{ano}.jsonl.gz
+outputs/contratacoes/2026/20261104_153000_contratacoes_2026.jsonl.gz
 ```
 
-Com `--saida`, a pasta informada é usada no lugar desse caminho. Em qualquer
-caso, ela pode não existir ou estar vazia. Se já tiver arquivos, a coleta é
-recusada com código 2, sem acessar a fonte, e nada é sobrescrito.
+Data e hora são as do início da execução, no horário local, e vêm primeiro para
+que a ordem alfabética seja a cronológica.
 
-| Arquivo | Granularidade | Chave |
-| --- | --- | --- |
-| `contratacoes.jsonl.gz` | release OCDS original, só as selecionadas | `ocid` |
-| `contratacoes.csv` | um processo de contratação | `ocid` |
-| `itens.csv` | um item licitado (`tender.items` + dados do lote) | `ocid` + `item_id` |
-| `adjudicacoes.csv` | um item adjudicado × fornecedor | `ocid` + `adjudicacao_id` + `item_id` + `fornecedor_id` |
-| `monitoramento.csv` | um ano processado (linhas lidas, selecionadas, duração, status) | `ano` |
-| `erros.csv` | linha ou ano com falha | — |
-| `coleta.log` | log da execução (também vai para a saída padrão, em UTF-8) | — |
+Com `--saida`, o caminho informado é usado no lugar desse. As pastas que
+faltarem são criadas. Em qualquer caso, se o destino já existir, seja arquivo ou
+pasta, a coleta é recusada com código 2, sem acessar a fonte, e nada é
+sobrescrito.
 
-Em `itens.csv`, `codigo_catalogo` é o código CATMAT/CATSER.
+O log vai só para a saída padrão, em UTF-8. Ao final, ele registra a URL pedida
+e a URL final, os bytes gravados e o `Content-Length`, o `Last-Modified`, o
+SHA-256 do arquivo, o tamanho descompactado e o tempo do download e da
+verificação.
 
-O arquivo de cada ano é baixado em streaming para uma pasta temporária
-`.download-*` dentro do destino. Ela é apagada ao final, mesmo em caso de falha,
-então toda execução baixa o ano de novo. O download confere o total recebido com
-o `Content-Length` informado pela fonte.
+## Integridade
 
-Um ano com falha (rede, HTTP, download incompleto) é registrado em `erros.csv` e
-em `monitoramento.csv` com status `falha`, e a coleta segue para os anos
-seguintes. Linhas que não podem ser lidas ou transformadas vão para `erros.csv`
-com o número da linha e não interrompem o ano.
+O arquivo é baixado em streaming para `{destino}.part`, na mesma pasta do
+destino. Só vira o arquivo final depois de passar por duas verificações:
+
+1. O total recebido é igual ao `Content-Length`, quando a fonte o informa.
+2. O gzip é lido inteiro, sem gravar o conteúdo. A leitura confere o CRC32 e o
+   tamanho original gravados no próprio arquivo, então falha com um arquivo
+   vazio, cortado, corrompido, com dados depois do fim do gzip ou que não seja
+   gzip (uma página de erro, por exemplo). As linhas não são interpretadas como
+   JSON.
+
+Em qualquer falha ou interrupção, o `.part` é apagado e o destino não é criado.
+Com o arquivo de 2026, a verificação leva menos de 1 s.
 
 ## Códigos de saída
 
 | Código | Situação |
 | --- | --- |
-| **0** | Todos os anos processados. |
-| **1** | Algum ano falhou no download ou na leitura. |
-| **2** | Argumento inválido ou pasta de destino com arquivos. |
+| **0** | Arquivo salvo e íntegro. |
+| **1** | Falha de rede, HTTP diferente de 200 e de 404, download incompleto, gzip inválido ou erro de escrita. |
+| **2** | Argumento ou configuração inválidos, ano não publicado (404) ou destino já existente. |
 
 ## Configuração
 
 As variáveis podem ser definidas no ambiente ou num `.env` na raiz do
-repositório, usando `.env.example` como referência. O ambiente tem precedência.
+repositório, usando `.env.example` como referência. O ambiente tem precedência,
+e uma variável definida mas vazia usa o padrão. Um valor inválido encerra com
+código 2 antes de acessar a fonte.
 
 | Variável | Padrão | Descrição |
 | --- | --- | --- |
-| `OCP_COMPRAS_DOWNLOAD_URL` | `https://data.open-contracting.org/en/publication/157/download` | Endereço de download da publicação; o ano vai em `?name={ano}.jsonl.gz`. |
-| `DOWNLOAD_TIMEOUT_SECONDS` | `60` | Timeout, por tentativa, para conectar e entre leituras da resposta. |
+| `OCP_DOWNLOAD_URL` | `https://data.open-contracting.org/en/publication/153/download` | Endereço de download da publicação; o ano vai em `?name={ano}.jsonl.gz`. HTTP(S), sem query ou fragmento. |
+| `DOWNLOAD_TIMEOUT_SECONDS` | `60` | Timeout, por tentativa, para conectar e entre leituras da resposta. Número positivo. |
+
+`OCP_DOWNLOAD_URL` substitui a antiga `OCP_COMPRAS_DOWNLOAD_URL`, que deixou de
+ser lida.
 
 Falhas de conexão e respostas HTTP **429, 500, 502, 503 e 504** são repetidas até
 oito vezes, com espera crescente de fator 2 e respeito ao cabeçalho
-`Retry-After`.
+`Retry-After`. Uma falha no meio da leitura do corpo não é repetida.
 
 ## Testes
 
 ```powershell
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -t . -v
 ```
 
-Os testes não acessam a OCP: usam um servidor HTTP local com um `.jsonl.gz`
-pequeno. Cobrem o filtro (UF, esfera, comprador sem `buyer.id`), o pré-filtro, o
-achatamento em contratações, itens e adjudicações, linhas inválidas, `--limite`,
-a pasta de saída (padrão, relativa, vazia e ocupada), 404, download truncado,
-remoção do temporário e o wrapper Bash chamado de outro diretório.
+Os testes não acessam a OCP: usam um servidor HTTP local. Cobrem:
+
+- a configuração (padrão, ambiente, valores inválidos e variáveis vazias) e os
+  argumentos;
+- o download com sucesso, com redirecionamento e sem `Content-Length`;
+- 404 e 500;
+- download truncado, gzip com CRC errado, resposta que não é gzip, dados depois
+  do gzip e corpo vazio;
+- a interrupção durante a verificação e, em todas as falhas, a remoção do `.part`;
+- o destino padrão, o `--saida` relativo e o destino existente;
+- o wrapper Bash chamado de outro diretório.
