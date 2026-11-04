@@ -2,11 +2,9 @@
 
 import gzip
 import hashlib
-import io
 import os
 import shutil
 import subprocess
-import tarfile
 import tempfile
 import threading
 import unittest
@@ -21,29 +19,9 @@ import requests
 
 from src.ETL.coletores import coleta_contratacoes as coletor
 
-URL_153 = "https://data.open-contracting.org/en/publication/153/download"
+URL_157 = "https://data.open-contracting.org/en/publication/157/download"
 LAST_MODIFIED = "Sun, 01 Nov 2026 00:10:23 GMT"
-
-
-def tar_gz(*membros):
-    """Monta um .tar.gz em memória; cada membro é (nome, bytes) ou um TarInfo pronto."""
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
-        for membro in membros:
-            if isinstance(membro, tarfile.TarInfo):
-                tar.addfile(membro)
-            else:
-                nome, dados = membro
-                info = tarfile.TarInfo(nome)
-                info.size = len(dados)
-                tar.addfile(info, io.BytesIO(dados))
-    return buffer.getvalue()
-
-
-MAIN_CSV = b"id,ocid\nr1,ocds-1\nr2,ocds-2\n"
-PARTIES_CSV = b"id,name,main_ocid\nBR-1,Orgao,ocds-1\n"
-CORPO = tar_gz(("2026/main.csv", MAIN_CSV), ("2026/parties.csv", PARTIES_CSV))
-TAMANHO_TAR = len(gzip.decompress(CORPO))
+CORPO = gzip.compress(b'{"ocid": "ocds-1"}\n{"ocid": "ocds-2"}\n')
 
 
 class ServidorLocal:
@@ -121,7 +99,7 @@ class TestConfiguracaoEArgumentos(unittest.TestCase):
 
     def test_configuracao_padrao(self):
         with self.ambiente():
-            self.assertEqual(coletor.configuracao(), coletor.Configuracao(URL_153, 60.0))
+            self.assertEqual(coletor.configuracao(), coletor.Configuracao(URL_157, 60.0))
 
     def test_configuracao_do_ambiente(self):
         with self.ambiente("http://x/download", "5"):
@@ -136,16 +114,16 @@ class TestConfiguracaoEArgumentos(unittest.TestCase):
 
     def test_url_do_ano(self):
         self.assertEqual(coletor.url_do_ano(coletor.Configuracao("http://x/download", 1.0), "2026"),
-                         "http://x/download?name=2026.csv.tar.gz")
+                         "http://x/download?name=2026.jsonl.gz")
 
     def test_destino_padrao(self):
         self.assertEqual(coletor.destino_padrao("2026", datetime(2026, 11, 4, 15, 30, 0)),
-                         coletor.PASTA_SAIDA / "2026" / "20261104_153000_contratacoes_2026.csv.tar.gz")
+                         coletor.PASTA_SAIDA / "2026" / "20261104_153000_contratacoes_2026.jsonl.gz")
 
     def test_argumentos_validos(self):
         self.assertEqual(coletor.le_argumentos(["--ano", "2026"]), ("2026", None))
-        self.assertEqual(coletor.le_argumentos(["--ano", "2026", "--saida", "a/b.csv.tar.gz"]),
-                         ("2026", Path("a/b.csv.tar.gz")))
+        self.assertEqual(coletor.le_argumentos(["--ano", "2026", "--saida", "a/b.jsonl.gz"]),
+                         ("2026", Path("a/b.jsonl.gz")))
 
     def test_argumentos_invalidos(self):
         for argv in ([], ["--ano", "26"], ["--ano", "abcd"], ["--ano", "２０２６"],
@@ -157,8 +135,8 @@ class TestConfiguracaoEArgumentos(unittest.TestCase):
 
 class TestBaixaEVerifica(ComServidor):
     def baixa(self, sessao=None):
-        self.destino = self.pasta / "sub" / "a.csv.tar.gz"
-        return coletor.baixa_e_verifica(sessao or coletor.sessao_http(), self.servidor.url + "?name=2026.csv.tar.gz",
+        self.destino = self.pasta / "sub" / "a.jsonl.gz"
+        return coletor.baixa_e_verifica(sessao or coletor.sessao_http(), self.servidor.url + "?name=2026.jsonl.gz",
                                         self.destino, 5.0)
 
     def falha(self, excecao, sessao=None):
@@ -171,8 +149,7 @@ class TestBaixaEVerifica(ComServidor):
         self.assertEqual(self.destino.read_bytes(), CORPO)
         self.assertEqual((download.bytes_gravados, download.content_length), (len(CORPO), len(CORPO)))
         self.assertEqual(download.sha256, hashlib.sha256(CORPO).hexdigest())
-        self.assertEqual(download.bytes_descompactados, TAMANHO_TAR)
-        self.assertEqual(download.arquivos_no_tar, 2)
+        self.assertEqual(download.bytes_descompactados, len(gzip.decompress(CORPO)))
         self.assertEqual(download.last_modified, LAST_MODIFIED)
         self.assertEqual(self.servidor.cabecalhos_recebidos[0]["Accept-Encoding"], "identity")
         self.assertEqual(list(self.pasta.rglob("*.part")), [])
@@ -181,7 +158,7 @@ class TestBaixaEVerifica(ComServidor):
         self.servidor.redireciona = True
         download = self.baixa()
         self.assertEqual(self.destino.read_bytes(), CORPO)
-        self.assertTrue(download.url_final.endswith("/cdn/2026.csv.tar.gz"), download.url_final)
+        self.assertTrue(download.url_final.endswith("/cdn/2026.jsonl.gz"), download.url_final)
 
     def test_sem_content_length(self):
         self.servidor.sem_content_length = True
@@ -236,60 +213,6 @@ class TestBaixaEVerifica(ComServidor):
         with patch.object(coletor, "verifica_gzip", side_effect=KeyboardInterrupt):
             self.falha(KeyboardInterrupt)
 
-    def test_gzip_que_nao_e_tar(self):
-        self.servidor.corpo = gzip.compress(b'{"ocid": "ocds-1"}\n')
-        self.falha(coletor.TarInvalido)
-
-    def test_tar_sem_arquivos(self):
-        pasta = tarfile.TarInfo("2026")
-        pasta.type = tarfile.DIRTYPE
-        self.servidor.corpo = tar_gz(pasta)
-        self.falha(coletor.TarInvalido)
-
-    def test_tar_com_caminho_perigoso(self):
-        for nome in ("../fora.csv", "/etc/fora.csv", "C:/fora.csv", "C:fora.csv", "2026\\..\\fora.csv",
-                     "2026/../../fora.csv"):
-            with self.subTest(nome=nome):
-                self.servidor.corpo = tar_gz(("2026/main.csv", MAIN_CSV), (nome, b"x"))
-                self.falha(coletor.TarInvalido)
-
-    def test_tar_com_link(self):
-        link = tarfile.TarInfo("2026/link.csv")
-        link.type = tarfile.SYMTYPE
-        link.linkname = "../../fora.csv"
-        self.servidor.corpo = tar_gz(("2026/main.csv", MAIN_CSV), link)
-        self.falha(coletor.TarInvalido)
-
-    def test_tar_com_cabecalho_corrompido_no_meio(self):
-        # O tarfile para em silêncio num cabeçalho inválido depois do primeiro
-        # membro; a exigência do marcador de fim é o que pega.
-        tar = bytearray(gzip.decompress(CORPO))
-        tar[1024:1124] = b"x" * 100  # nome e campos do cabeçalho do segundo membro
-        self.servidor.corpo = gzip.compress(bytes(tar))
-        self.falha(coletor.TarInvalido)
-
-    def test_tar_com_nomes_longos(self):
-        # Nomes longos usam cabeçalhos extras (PAX e GNU); devem ser aceitos.
-        nome = "2026/" + "tabela_com_nome_muito_comprido_" * 5 + "ç.csv"
-        for formato in (tarfile.PAX_FORMAT, tarfile.GNU_FORMAT):
-            with self.subTest(formato=formato):
-                buffer = io.BytesIO()
-                with tarfile.open(fileobj=buffer, mode="w:gz", format=formato) as tar:
-                    info = tarfile.TarInfo(nome)
-                    info.size = len(MAIN_CSV)
-                    tar.addfile(info, io.BytesIO(MAIN_CSV))
-                self.servidor.corpo = buffer.getvalue()
-                self.assertEqual(self.baixa().arquivos_no_tar, 1)
-                self.destino.unlink()
-
-    def test_tar_cortado_dentro_do_gzip(self):
-        # gzip íntegro de um tar incompleto. Cortado entre membros (2048: os dois
-        # membros inteiros, sem os blocos de fim), o tarfile leria sem erro.
-        for corte in (700, 2048):
-            with self.subTest(corte=corte):
-                self.servidor.corpo = gzip.compress(gzip.decompress(CORPO)[:corte])
-                self.falha(coletor.TarInvalido)
-
 
 class TestMain(ComServidor):
     def setUp(self):
@@ -300,7 +223,7 @@ class TestMain(ComServidor):
                          patch("sys.stderr", StringIO())):  # mensagens de erro do logging
             contexto.start()
             self.addCleanup(contexto.stop)
-        self.destino = self.pasta / "saida" / "a.csv.tar.gz"
+        self.destino = self.pasta / "saida" / "a.jsonl.gz"
 
     def executa(self, *argumentos):
         return coletor.main(["--ano", "2026", "--saida", str(self.destino), *argumentos])
@@ -312,22 +235,22 @@ class TestMain(ComServidor):
         texto = "\n".join(logs.output)
         self.assertIn(hashlib.sha256(CORPO).hexdigest(), texto)
         self.assertIn(self.servidor.url, texto)
-        self.assertEqual(self.servidor.caminhos, ["/download?name=2026.csv.tar.gz"])
+        self.assertEqual(self.servidor.caminhos, ["/download?name=2026.jsonl.gz"])
 
     def test_destino_padrao(self):
         self.assertEqual(coletor.main(["--ano", "2026"]), 0)
         arquivos = [p.name for p in (self.pasta / "padrao" / "2026").iterdir()]
         self.assertEqual(len(arquivos), 1)
-        self.assertRegex(arquivos[0], r"^\d{8}_\d{6}_contratacoes_2026\.csv\.tar\.gz$")
+        self.assertRegex(arquivos[0], r"^\d{8}_\d{6}_contratacoes_2026\.jsonl\.gz$")
 
     def test_saida_relativa(self):
         anterior = os.getcwd()
         os.chdir(self.pasta)
         try:
-            self.assertEqual(coletor.main(["--ano", "2026", "--saida", "rel/sub/a.csv.tar.gz"]), 0)
+            self.assertEqual(coletor.main(["--ano", "2026", "--saida", "rel/sub/a.jsonl.gz"]), 0)
         finally:
             os.chdir(anterior)
-        self.assertEqual((self.pasta / "rel" / "sub" / "a.csv.tar.gz").read_bytes(), CORPO)
+        self.assertEqual((self.pasta / "rel" / "sub" / "a.jsonl.gz").read_bytes(), CORPO)
 
     def test_destino_existente_recusado_sem_acessar_a_fonte(self):
         self.destino.parent.mkdir(parents=True)
@@ -371,7 +294,7 @@ class TestMain(ComServidor):
 
     def test_pasta_da_saida_e_um_arquivo(self):
         (self.pasta / "arquivo").write_text("x")
-        self.assertEqual(coletor.main(["--ano", "2026", "--saida", str(self.pasta / "arquivo" / "a.csv.tar.gz")]), 1)
+        self.assertEqual(coletor.main(["--ano", "2026", "--saida", str(self.pasta / "arquivo" / "a.jsonl.gz")]), 1)
         self.assertEqual(list(self.pasta.rglob("*.part")), [])
 
 
@@ -398,14 +321,14 @@ class TestWrapper(unittest.TestCase):
         ambiente = {**os.environ, "OCP_DOWNLOAD_URL": servidor.url, "DOWNLOAD_TIMEOUT_SECONDS": "5"}
         with tempfile.TemporaryDirectory() as tmp:
             processo = subprocess.run(
-                [bash_compativel(), WRAPPER.as_posix(), "--ano", "2026", "--saida", "outputs/x/a.csv.tar.gz"],
+                [bash_compativel(), WRAPPER.as_posix(), "--ano", "2026", "--saida", "outputs/x/a.jsonl.gz"],
                 cwd=tmp, env=ambiente, capture_output=True, text=True, encoding="utf-8", timeout=120,
             )
             self.assertEqual(processo.returncode, 0, processo.stdout + processo.stderr)
-            self.assertEqual((Path(tmp) / "outputs" / "x" / "a.csv.tar.gz").read_bytes(), CORPO)
+            self.assertEqual((Path(tmp) / "outputs" / "x" / "a.jsonl.gz").read_bytes(), CORPO)
             self.assertIn("Arquivo salvo", processo.stdout)
             self.assertIn("verificação", processo.stdout)  # UTF-8 mesmo em pipe
-        self.assertEqual(servidor.caminhos, ["/download?name=2026.csv.tar.gz"])
+        self.assertEqual(servidor.caminhos, ["/download?name=2026.jsonl.gz"])
 
     def test_wrapper_argumento_invalido(self):
         with tempfile.TemporaryDirectory() as tmp:
