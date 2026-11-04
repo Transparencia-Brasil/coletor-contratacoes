@@ -1,25 +1,27 @@
-"""Baixa o arquivo anual de contratações de medicamentos em OCDS e verifica a integridade.
+"""Baixa o arquivo anual de contratações de medicamentos em CSV e verifica a integridade.
 
 Fonte: publicação 153 do OCP Data Registry (Medicamentos Transparentes), com um
-arquivo JSON Lines compactado por ano, `{ano}.jsonl.gz`, em que cada linha é um
-processo de contratação (release compilada OCDS). O arquivo é salvo byte a byte
-como foi recebido: nenhuma linha é filtrada, convertida ou reescrita.
+arquivo `{ano}.csv.tar.gz` por ano. Ele traz as tabelas CSV do OCDS achatado
+(main.csv, parties.csv, tender_items.csv, awards.csv e outras), ligadas pela
+coluna main_ocid. O arquivo é salvo byte a byte como foi recebido: nada é
+extraído, filtrado ou reescrito.
 
 Uso, a partir de qualquer diretório:
     python src/ETL/coletores/coleta_contratacoes.py --ano 2026
-    python src/ETL/coletores/coleta_contratacoes.py --ano 2026 --saida caminho/2026.jsonl.gz
+    python src/ETL/coletores/coleta_contratacoes.py --ano 2026 --saida caminho/2026.csv.tar.gz
 
 Sem --saida, o arquivo vai para
-outputs/contratacoes/{ano}/{AAAAMMDD}_{HHMMSS}_contratacoes_{ano}.jsonl.gz, na
+outputs/contratacoes/{ano}/{AAAAMMDD}_{HHMMSS}_contratacoes_{ano}.csv.tar.gz, na
 raiz do repositório. Um destino que já exista é recusado.
 
 O download é gravado num .part ao lado do destino. Antes de virar o arquivo
-final, o total recebido é conferido com o Content-Length e o gzip é lido
-inteiro, o que confere o CRC e o tamanho original gravados nele.
+final, o total recebido é conferido com o Content-Length, o gzip é lido
+inteiro, o que confere o CRC e o tamanho original gravados nele, e o tar é lido
+arquivo por arquivo.
 
 Códigos de saída: 0 arquivo salvo e íntegro; 1 falha de rede, HTTP, download
-incompleto, gzip inválido ou erro de escrita; 2 argumento ou configuração
-inválidos, ano não publicado ou destino já existente.
+incompleto, gzip ou tar inválido ou erro de escrita; 2 argumento ou
+configuração inválidos, ano não publicado ou destino já existente.
 """
 
 from __future__ import annotations
@@ -32,11 +34,12 @@ import math
 import os
 import re
 import sys
+import tarfile
 import time
 import zlib
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 import requests
@@ -128,8 +131,8 @@ def le_argumentos(argv: list[str] | None = None) -> tuple[str, Path | None]:
 
 
 def url_do_ano(config: Configuracao, ano: str) -> str:
-    """URL do arquivo do ano, como {url_base}?name=2026.jsonl.gz."""
-    return f"{config.url_base}?name={ano}.jsonl.gz"
+    """URL do arquivo do ano, como {url_base}?name=2026.csv.tar.gz."""
+    return f"{config.url_base}?name={ano}.csv.tar.gz"
 
 
 def destino_padrao(ano: str, momento: datetime) -> Path:
@@ -137,9 +140,9 @@ def destino_padrao(ano: str, momento: datetime) -> Path:
 
     A data e a hora vêm primeiro, no formato AAAAMMDD_HHMMSS, para que a ordem
     alfabética seja a cronológica. Exemplo:
-    outputs/contratacoes/2026/20261104_153000_contratacoes_2026.jsonl.gz.
+    outputs/contratacoes/2026/20261104_153000_contratacoes_2026.csv.tar.gz.
     """
-    return PASTA_SAIDA / ano / f"{momento:%Y%m%d_%H%M%S}_contratacoes_{ano}.jsonl.gz"
+    return PASTA_SAIDA / ano / f"{momento:%Y%m%d_%H%M%S}_contratacoes_{ano}.csv.tar.gz"
 
 
 # ------------------------------------------------------------------------------
@@ -158,6 +161,10 @@ class GzipInvalido(Exception):
     """O arquivo recebido está vazio, corrompido ou não é gzip."""
 
 
+class TarInvalido(Exception):
+    """O gzip está íntegro, mas o conteúdo não é um tar completo e seguro de extrair."""
+
+
 @dataclass(frozen=True)
 class Download:
     """Resumo de um download salvo e verificado.
@@ -169,9 +176,10 @@ class Download:
         content_length: Tamanho declarado pela fonte, se enviado.
         last_modified: Cabeçalho Last-Modified da fonte, se enviado.
         sha256: Hash SHA-256 do arquivo salvo, em hexadecimal.
-        bytes_descompactados: Tamanho do conteúdo descompactado.
+        bytes_descompactados: Tamanho do tar descompactado.
+        arquivos_no_tar: Quantos arquivos (as tabelas CSV) o tar contém.
         segundos_download: Duração do download.
-        segundos_verificacao: Duração da leitura do gzip.
+        segundos_verificacao: Duração das leituras do gzip e do tar.
     """
 
     url_final: str
@@ -180,6 +188,7 @@ class Download:
     last_modified: str | None
     sha256: str
     bytes_descompactados: int
+    arquivos_no_tar: int
     segundos_download: float
     segundos_verificacao: float
 
@@ -238,19 +247,82 @@ def verifica_gzip(arquivo: Path) -> int:
     return total
 
 
+def caminho_inseguro(nome: str) -> bool:
+    """Diz se um nome de membro do tar escaparia da pasta de extração.
+
+    Cobre caminho absoluto, letra de unidade do Windows, barra invertida e
+    qualquer componente "..".
+    """
+    caminho = PurePosixPath(nome)
+    return (caminho.is_absolute() or "\\" in nome or re.match(r"[A-Za-z]:", nome) is not None
+            or ".." in caminho.parts)
+
+
+def verifica_tar(arquivo: Path) -> int:
+    """Lê o tar do arquivo, membro a membro, descartando o conteúdo.
+
+    Aceita só arquivos e pastas com caminhos relativos e sem "..", para que a
+    extração feita depois, por quem usa o arquivo, fique dentro da pasta de
+    destino. Exige o marcador de fim do tar (blocos de zeros): sem ele, um tar
+    cortado exatamente entre dois membros seria lido sem erro.
+
+    Returns:
+        Quantidade de arquivos no tar.
+
+    Raises:
+        TarInvalido: Se o conteúdo não for tar, estiver incompleto, não tiver
+            arquivos ou tiver um membro inseguro (link, dispositivo, caminho
+            absoluto ou com "..").
+    """
+    arquivos = 0
+    try:
+        with tarfile.open(arquivo, "r:gz") as tar:
+            for membro in tar:
+                if caminho_inseguro(membro.name):
+                    raise TarInvalido(f"caminho inseguro no tar: {membro.name!r}")
+                if membro.isdir():
+                    continue
+                if not membro.isfile():
+                    raise TarInvalido(f"membro que não é arquivo nem pasta no tar: {membro.name!r}")
+                with tar.extractfile(membro) as dados:
+                    while dados.read(TAMANHO_BLOCO):
+                        pass
+                arquivos += 1
+            # Depois do último membro, tar.offset aponta para onde a leitura parou.
+            fim_dos_membros = tar.offset
+        # Depois dos membros, só pode haver zeros, e pelo menos dois blocos deles.
+        # A leitura é em blocos e para no primeiro byte que não seja zero.
+        zeros = 0
+        with gzip.open(arquivo, "rb") as entrada:
+            entrada.seek(fim_dos_membros)
+            while bloco := entrada.read(TAMANHO_BLOCO):
+                if bloco.strip(b"\0"):
+                    raise TarInvalido("há dados depois do fim do tar")
+                zeros += len(bloco)
+    except (tarfile.TarError, OSError, EOFError, zlib.error) as erro:
+        raise TarInvalido(f"{type(erro).__name__}: {erro}") from erro
+    if zeros < 2 * tarfile.BLOCKSIZE:
+        raise TarInvalido("o tar não termina com o marcador de fim de arquivo")
+    if arquivos == 0:
+        raise TarInvalido("o tar não tem arquivos")
+    return arquivos
+
+
 def baixa_e_verifica(sessao: requests.Session, url: str, destino: Path, timeout: float) -> Download:
     """Baixa a URL, verifica a integridade e só então publica o arquivo no destino.
 
     O corpo é gravado em blocos num .part ao lado do destino, byte a byte como
     chegou (um Content-Encoding não é decodificado), com o SHA-256 calculado
-    durante a gravação. Depois de conferido o Content-Length e lido
-    o gzip inteiro, o .part substitui o destino de forma atômica. Em qualquer
-    falha ou interrupção, o .part é removido e o destino não é criado.
+    durante a gravação. Depois de conferido o Content-Length, lido o gzip
+    inteiro e lido o tar membro a membro, o .part substitui o destino de forma
+    atômica. Em qualquer falha ou interrupção, o .part é removido e o destino
+    não é criado.
 
     Args:
         sessao: Sessão HTTP, normalmente criada por sessao_http().
         url: Endereço do arquivo.
-        destino: Caminho final; a pasta é criada se não existir.
+        destino: Caminho final; a pasta é criada, se não existir, só depois de
+            a fonte responder 200.
         timeout: Segundos para conectar e entre leituras sucessivas da resposta.
 
     Raises:
@@ -259,9 +331,9 @@ def baixa_e_verifica(sessao: requests.Session, url: str, destino: Path, timeout:
         requests.RequestException: Para falhas de conexão ou de leitura.
         DownloadIncompleto: Se o total gravado diferir do Content-Length.
         GzipInvalido: Se o arquivo não passar na leitura do gzip.
+        TarInvalido: Se o conteúdo não passar na leitura do tar.
         OSError: Para falhas ao criar a pasta ou gravar o arquivo.
     """
-    destino.parent.mkdir(parents=True, exist_ok=True)
     part = destino.with_name(destino.name + ".part")
     try:
         inicio = time.monotonic()
@@ -274,6 +346,8 @@ def baixa_e_verifica(sessao: requests.Session, url: str, destino: Path, timeout:
             content_length = int(cabecalho_tamanho) if cabecalho_tamanho is not None else None
             hash_arquivo = hashlib.sha256()
             gravados = 0
+            # Só agora: um 404 ou outro erro não deixa pasta vazia para trás.
+            destino.parent.mkdir(parents=True, exist_ok=True)
             with part.open("wb") as saida:
                 try:
                     # Bytes crus da conexão: o iter_content decodificaria um
@@ -294,12 +368,13 @@ def baixa_e_verifica(sessao: requests.Session, url: str, destino: Path, timeout:
 
         inicio = time.monotonic()
         descompactados = verifica_gzip(part)
+        arquivos = verifica_tar(part)
         segundos_verificacao = time.monotonic() - inicio
         part.replace(destino)
     finally:
         part.unlink(missing_ok=True)
     return Download(url_final, gravados, content_length, last_modified, hash_arquivo.hexdigest(),
-                    descompactados, segundos_download, segundos_verificacao)
+                    descompactados, arquivos, segundos_download, segundos_verificacao)
 
 
 # ------------------------------------------------------------------------------
@@ -311,8 +386,8 @@ def main(argv: list[str] | None = None) -> int:
 
     Returns:
         0 quando o arquivo é salvo e íntegro; 1 para falha de rede, HTTP
-        diferente de 200 e de 404, download incompleto, gzip inválido ou erro
-        de escrita; 2 para configuração inválida, ano não publicado ou destino
+        diferente de 200 e de 404, download incompleto, gzip ou tar inválido
+        ou erro de escrita; 2 para configuração inválida, ano não publicado ou destino
         já existente. Argumentos inválidos encerram pelo argparse, também com
         código 2.
     """
@@ -339,13 +414,16 @@ def main(argv: list[str] | None = None) -> int:
     except GzipInvalido as erro:
         log.error("O arquivo recebido não é um gzip íntegro: %s", erro)
         return 1
+    except TarInvalido as erro:
+        log.error("O arquivo recebido não é um tar íntegro: %s", erro)
+        return 1
     except (requests.RequestException, DownloadIncompleto, OSError) as erro:
         log.error("Falha no download: %s", erro)
         return 1
 
     log.info(
         "Arquivo salvo em %s | URL final: %s | %d bytes (Content-Length: %s) | Last-Modified: %s | "
-        "SHA-256: %s | %d bytes descompactados | download %.1f s, verificação %.1f s",
+        "SHA-256: %s | %d bytes descompactados, %d arquivos no tar | download %.1f s, verificação %.1f s",
         destino,
         download.url_final,
         download.bytes_gravados,
@@ -353,6 +431,7 @@ def main(argv: list[str] | None = None) -> int:
         download.last_modified or "não informado",
         download.sha256,
         download.bytes_descompactados,
+        download.arquivos_no_tar,
         download.segundos_download,
         download.segundos_verificacao,
     )

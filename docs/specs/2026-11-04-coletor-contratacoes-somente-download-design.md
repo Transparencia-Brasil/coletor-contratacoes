@@ -1,19 +1,22 @@
 # Coletor de contratações: somente download e verificação de integridade
 
-Data: 2026-11-04. Status: aprovado em conversa, aguardando implementação.
+Data: 2026-11-04. Status: implementado. Revisão 1 (2026-11-04): o arquivo
+baixado passa a ser `{ano}.csv.tar.gz` (tabelas CSV) em vez de `{ano}.jsonl.gz`,
+com verificação do tar; a extração, o filtro dos compradores do DF e as tabelas
+filtradas ficam na task `coleta-contratacoes` do `medicamentos-fdcc`.
 
 ## Objetivo
 
-Baixar, para um ano informado, o arquivo `{ano}.jsonl.gz` da publicação 153 do
+Baixar, para um ano informado, o arquivo `{ano}.csv.tar.gz` da publicação 153 do
 OCP Data Registry (Medicamentos Transparentes), verificar se ele chegou íntegro
-e salvá-lo exatamente como veio. O coletor não filtra, não converte e não
-reescreve dados.
+e salvá-lo exatamente como veio. O coletor não extrai, não filtra, não converte e
+não reescreve dados.
 
 Hoje o coletor baixa a publicação 157 (Compras.gov.br), filtra por UF e esfera e
 gera CSVs (contratações, itens, adjudicações, monitoramento e erros). Esse
-tratamento sai do coletor e não é migrado: o tratamento dos dados baixados fica
-no `medicamentos-fdcc`, no script `tasks/mapeamento-ocds/src/mapeamento-compras-ocds.py`,
-que será reescrito para receber o OCDS da publicação 153.
+tratamento sai do coletor: a extração do tar, o filtro dos compradores do DF e a
+gravação das tabelas filtradas ficam na task `coleta-contratacoes` do
+`medicamentos-fdcc`.
 
 ## Fonte
 
@@ -25,7 +28,14 @@ Medicamentos Transparentes, sob licença CC BY 4.0:
 - Contém só os itens de medicamentos (CATMAT classe 6505). Eles são selecionados
   por filtro de princípio ativo na descrição e associados a um item do CATMAT por
   um modelo de linguagem (LLM). É um dado derivado, não a fonte oficial.
-- Já vem em OCDS, uma release compilada por linha.
+- O arquivo CSV de cada ano é um `.tar.gz` com o OCDS achatado em 13 tabelas,
+  ligadas pela coluna `main_ocid`: `main.csv` (um processo por linha),
+  `parties.csv`, `parties_additionalIdentifiers.csv`,
+  `parties_details_classifications.csv`, `tender_items.csv`,
+  `tender_items_activeIngredients.csv`, `tender_items_attributes.csv`,
+  `tender_lots.csv`, `tender_lots_sustainability.csv`, `awards.csv`,
+  `awards_items.csv`, `awards_items_deliveryLocations.csv` e
+  `awards_suppliers.csv`, todas dentro de uma pasta `{ano}/`.
 
 A publicação 157 (Compras.gov.br, SEGES/MGI) segue o mesmo padrão de URL e
 continua acessível pela variável `OCP_DOWNLOAD_URL`, caso seja preciso comparar
@@ -33,19 +43,26 @@ com a fonte oficial.
 
 ## Contexto verificado em 2026-11-04
 
-- `GET https://data.open-contracting.org/en/publication/153/download?name=2026.jsonl.gz`
+- `GET https://data.open-contracting.org/en/publication/153/download?name=2026.csv.tar.gz`
   responde `302` para
-  `https://fastly.data.open-contracting.org/downloads/brazil_medicamentos_transparentes/4353/2026.jsonl.gz`.
+  `https://fastly.data.open-contracting.org/downloads/brazil_medicamentos_transparentes/4353/2026.csv.tar.gz`.
   O número `4353` identifica a versão da publicação e muda a cada atualização.
-- O CDN envia `Content-Length` (6.624.895 bytes em 2026),
-  `Content-Type: application/gzip`, `Last-Modified` (01/11/2026) e `ETag`.
-- Há arquivos de 2021 a 2026, um `full.jsonl.gz` com tudo (39,7 MB) e arquivos
+- O CDN envia `Content-Length` (8.347.771 bytes em 2026),
+  `Content-Type: application/gzip`, `Last-Modified` (01/11/2026) e `ETag`. O tar
+  descompactado tem 68.833.280 bytes, e `main.csv` tem 10.717 processos.
+- Nas tabelas, a UF do comprador vem por extenso em `parties.csv`
+  (`address_region` = "Distrito Federal"), e a esfera fica em
+  `parties_details_classifications.csv` (esquema `BRA-ESFERA`). Em 2026, 164
+  processos têm comprador no DF: 101 federais, 47 distritais e 16 "Não se
+  aplica".
+- Há arquivos de 2021 a 2026, um `full.csv.tar.gz` com tudo (50,5 MB) e arquivos
   `2304` e `2400`, que devem vir de datas erradas nos dados. Como `--ano` aceita
   quatro dígitos, esses também podem ser baixados.
 - Um ano não publicado (`2019`) responde `404`.
 - A fonte não publica checksum. O `ETag` é formado pelo tamanho e pela data, não
-  por um hash do conteúdo. A integridade é verificada pelo `Content-Length` e
-  pelo CRC32 e pelo tamanho original gravados no próprio gzip.
+  por um hash do conteúdo. A integridade é verificada pelo `Content-Length`,
+  pelo CRC32 e pelo tamanho original gravados no próprio gzip e pela leitura do
+  tar.
 - A publicação 157 se comporta igual: `302` para o CDN, `Content-Length`,
   `Last-Modified` e `404` para ano não publicado.
 
@@ -53,7 +70,7 @@ com a fonte oficial.
 
 ```text
 python src/ETL/coletores/coleta_contratacoes.py --ano 2026
-python src/ETL/coletores/coleta_contratacoes.py --ano 2026 --saida caminho/2026.jsonl.gz
+python src/ETL/coletores/coleta_contratacoes.py --ano 2026 --saida caminho/2026.csv.tar.gz
 bash   src/ETL/coletores/run-coleta-contratacoes.sh --ano 2026
 ```
 
@@ -71,8 +88,8 @@ bash   src/ETL/coletores/run-coleta-contratacoes.sh --ano 2026
 Sem `--saida`:
 
 ```text
-outputs/contratacoes/{ano}/{AAAAMMDD}_{HHMMSS}_contratacoes_{ano}.jsonl.gz
-outputs/contratacoes/2026/20261104_153000_contratacoes_2026.jsonl.gz
+outputs/contratacoes/{ano}/{AAAAMMDD}_{HHMMSS}_contratacoes_{ano}.csv.tar.gz
+outputs/contratacoes/2026/20261104_153000_contratacoes_2026.csv.tar.gz
 ```
 
 Na raiz do repositório, independentemente do diretório de execução. Data e hora
@@ -88,7 +105,7 @@ Lida do ambiente ou do `.env` na raiz. O ambiente tem precedência.
 
 | Variável | Padrão | Uso |
 | --- | --- | --- |
-| `OCP_DOWNLOAD_URL` | `https://data.open-contracting.org/en/publication/153/download` | Endereço de download da publicação; o ano vai em `?name={ano}.jsonl.gz`. HTTP(S), com host, sem query nem fragmento. |
+| `OCP_DOWNLOAD_URL` | `https://data.open-contracting.org/en/publication/153/download` | Endereço de download da publicação; o ano vai em `?name={ano}.csv.tar.gz`. HTTP(S), com host, sem query nem fragmento. |
 | `DOWNLOAD_TIMEOUT_SECONDS` | `60` | Segundos, por tentativa, para conectar e entre leituras da resposta. Número positivo e finito. |
 
 Uma variável definida mas vazia usa o padrão. Um valor inválido encerra com
@@ -116,9 +133,16 @@ publicação 157. A variável antiga deixa de ser lida.
    2. O `.part` é lido inteiro com `gzip.open`, em blocos, e o resultado é
       descartado. O módulo confere o CRC32 e o tamanho original de cada membro
       do gzip. Arquivo cortado, corrompido, com lixo depois do gzip ou que não
-      seja gzip falha aqui. Nada do conteúdo é interpretado: as linhas não são
-      lidas como JSON.
-7. Só depois das duas verificações, o `.part` substitui o destino de forma
+      seja gzip falha aqui.
+   3. O tar é lido membro a membro, e o conteúdo é descartado. Ele precisa ter
+      pelo menos um arquivo e terminar com o marcador de fim (dois blocos de
+      zeros): sem essa exigência, um tar cortado exatamente entre dois membros,
+      dentro de um gzip íntegro, seria lido sem erro. Só são aceitos arquivos e
+      pastas com caminho relativo, sem `..`, sem letra de unidade e sem barra
+      invertida; links e dispositivos são recusados. Assim, extrair o arquivo
+      depois não grava nada fora da pasta escolhida. O conteúdo dos CSVs não é
+      interpretado.
+7. Só depois das três verificações, o `.part` substitui o destino de forma
    atômica (`Path.replace`).
 8. Em qualquer falha ou interrupção, o `.part` é removido e o destino não é
    criado.
@@ -135,7 +159,7 @@ download bem-sucedido, o log registra:
   enviado;
 - o `Last-Modified`, ou a informação de que ele não foi enviado;
 - o SHA-256 do arquivo;
-- o tamanho descompactado;
+- o tamanho descompactado e quantos arquivos o tar contém;
 - o tempo do download e o tempo da verificação.
 
 ## Códigos de saída
@@ -143,7 +167,7 @@ download bem-sucedido, o log registra:
 | Código | Situação |
 | --- | --- |
 | 0 | Arquivo salvo e íntegro. |
-| 1 | Falha de rede, HTTP diferente de 200 e de 404, download incompleto, gzip inválido ou erro de escrita. |
+| 1 | Falha de rede, HTTP diferente de 200 e de 404, download incompleto, gzip ou tar inválido ou erro de escrita. |
 | 2 | Argumento ou configuração inválidos, ano não publicado (404) ou destino já existente. |
 
 ## Código
@@ -161,13 +185,16 @@ download bem-sucedido, o log registra:
 Sem acesso à OCP, com o servidor HTTP local que já existe nos testes:
 
 - sucesso: código 0 e arquivo salvo idêntico ao servido;
-- destino padrão (`outputs/contratacoes/{ano}/{AAAAMMDD}_{HHMMSS}_contratacoes_{ano}.jsonl.gz`);
+- destino padrão (`outputs/contratacoes/{ano}/{AAAAMMDD}_{HHMMSS}_contratacoes_{ano}.csv.tar.gz`);
 - `--saida` relativo ao diretório atual, criando as pastas que faltam;
 - destino existente (arquivo ou pasta) recusado com código 2 sem acessar a fonte;
 - 404 com código 2 e 500 com código 1;
 - download truncado pelo `Content-Length`, com código 1;
 - gzip com o tamanho certo e o CRC errado, com código 1;
 - resposta 200 que não é gzip, com código 1;
+- gzip que não é tar, tar sem arquivos, tar cortado no meio de um membro e entre
+  membros, membro com caminho inseguro (`../`, absoluto, `C:/`) e link, com
+  código 1;
 - em todas as falhas: nenhum `.part` sobra e o destino não é criado;
 - argumentos inválidos (`--ano` ausente, `26`, `abcd`, `２０２６` e as opções que
   saíram), com código 2;
@@ -189,14 +216,15 @@ O wrapper da task `coleta-contratacoes` passa `--anos`, `--uf` e `--esferas` e
 espera uma pasta de saída. Ele deixa de funcionar com esta versão. O merge desta
 mudança na `main` deste repositório deve esperar a task de lá ser adaptada: ela
 passa a chamar o coletor uma vez por ano, com `--saida` apontando para o
-arquivo. O tratamento sobre os arquivos baixados fica no
-`mapeamento-compras-ocds.py` reescrito. As duas adaptações são trabalho do
-`medicamentos-fdcc`, fora desta especificação.
+arquivo `.csv.tar.gz`, extrai as tabelas e grava as tabelas filtradas para os
+compradores do DF. Essa adaptação é trabalho do `medicamentos-fdcc`, fora desta
+especificação.
 
 ## Fora do escopo
 
 - Vários anos por execução.
-- Validar o conteúdo das linhas (JSON, campos OCDS).
-- Arquivo de metadados ou de checksum ao lado do `.jsonl.gz`; o SHA-256 fica no
+- Validar o conteúdo dos CSVs (colunas, campos OCDS).
+- Extrair o tar.
+- Arquivo de metadados ou de checksum ao lado do `.csv.tar.gz`; o SHA-256 fica no
   log.
 - Reaproveitar um download anterior do mesmo ano.
